@@ -156,7 +156,7 @@ class ClientProfileSetup(BaseModel):
 
 
 class Registration(BaseModel):
-    email: str = Field(min_length=6, max_length=254)
+    email: str | None = Field(default=None, max_length=254)
     password: str = Field(min_length=12, max_length=200)
     role: str
     phone: str | None = Field(default=None, max_length=30)
@@ -167,8 +167,10 @@ class Registration(BaseModel):
     @field_validator("email")
     @classmethod
     def normalize_email(cls, value):
+        if value is None or not value.strip():
+            return None
         value = value.strip().lower()
-        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+        if len(value)<6 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
             raise ValueError("Enter a valid email address.")
         return value
 
@@ -176,7 +178,7 @@ class Registration(BaseModel):
     @classmethod
     def allowed_role(cls, value):
         if value not in {"family", "contributor", "operator"}:
-            raise ValueError("Choose Elder, Guardian / relative, Helper / contributor, or Main admin.")
+            raise ValueError("Choose Gig Worker. Organisation admins are provisioned by secure bootstrap.")
         return value
 
 
@@ -223,9 +225,11 @@ class NotificationContactUpdate(BaseModel):
 
 class ContributorInput(BaseModel):
     display_name: str = Field(min_length=1, max_length=100)
+    address: str = Field(min_length=8, max_length=500)
     date_of_birth: date
     profession: str = Field(min_length=2, max_length=100)
-    identity_document_type: str = Field(pattern="^(Aadhaar verification reference|Passport|Driving licence|Voter ID|Other)$")
+    identity_document_type: str = Field(pattern="^Authorized Aadhaar provider reference$")
+    identity_mode: str = Field(default="development_sandbox", pattern="^(development_sandbox|authorized_provider)$")
     identity_reference: str = Field(min_length=5, max_length=240)
     identity_consent: bool
     city: str = Field(min_length=1, max_length=100)
@@ -243,6 +247,8 @@ class ContributorInput(BaseModel):
 
 
 class AdminGigInput(BaseModel):
+    title: str = Field(default="", max_length=120)
+    description: str = Field(default="", max_length=500)
     client_name: str = Field(min_length=1, max_length=100)
     client_phone: str = Field(min_length=7, max_length=30)
     client_address: str = Field(min_length=8, max_length=500)
@@ -255,8 +261,13 @@ class AdminGigInput(BaseModel):
     start_time: time
     duration_hours: int = Field(ge=1, le=8)
     fare_inr: int = Field(ge=100, le=100000)
+    offered_payout_inr: int | None = Field(default=None, ge=0, le=100000)
     language: str = Field(min_length=1, max_length=40)
     instructions: str = Field(default="", max_length=1000)
+    required_skills: list[str] = Field(default_factory=list, max_length=8)
+    priority: str = Field(default="standard", pattern="^(standard|high|urgent)$")
+    helpers_needed: int = Field(default=1, ge=1, le=1)
+    assigned_worker_id: str | None = None
     consent_confirmed: bool
 
     @field_validator("client_phone", "contact_phone")
@@ -334,6 +345,11 @@ def _audit(conn, actor, action, entity_type, entity_id, metadata=None):
                  (uid(), actor, action, entity_type, entity_id, json_dump(metadata or {}), stamp()))
 
 
+def _org_notify(conn, event_type, title, body, entity_type="", entity_id=""):
+    conn.execute("INSERT INTO organization_notifications(id,event_type,title,body,entity_type,entity_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                 (uid(), event_type, title[:160], body[:800], entity_type, entity_id, stamp()))
+
+
 def _role(actor, *roles):
     if actor["role"] not in roles:
         raise HTTPException(403, "This role cannot perform that action.")
@@ -348,13 +364,19 @@ def _actor(request: Request):
     digest = token_hash(token, settings.APP_SECRET)
     with db.transaction() as conn:
         row = conn.one("SELECT s.csrf_hash,s.expires_at,u.id,u.email,u.role,u.is_active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?", (digest,))
-    if not row or row["expires_at"] < stamp() or not row["is_active"]:
+    if not row or row["expires_at"] < stamp():
         raise HTTPException(401, "Session expired. Sign in again.")
-    return {"id": row["id"], "email": row["email"], "role": row["role"], "csrf_hash": row["csrf_hash"]}
+    if row["role"] not in {"operator", "contributor"}:
+        raise HTTPException(403, "This service now supports organisation admins and gig workers only.")
+    if not row["is_active"] and (row["role"]!="contributor" or request.url.path not in {"/api/auth/me","/api/auth/csrf","/api/auth/logout","/api/contributor","/api/contributor/earnings","/api/contributor/reviews"}):
+        raise HTTPException(401,"Worker account is suspended. Contact the organisation admin.")
+    return {"id": row["id"], "email": row["email"], "role": row["role"], "active":bool(row["is_active"]), "csrf_hash": row["csrf_hash"]}
 
 
 def _write_actor(request: Request, x_csrf_token: str | None = Header(default=None)):
     actor = _actor(request)
+    if not actor["active"] and request.url.path!="/api/auth/logout":
+        raise HTTPException(403,"Suspended worker accounts cannot make changes.")
     if not x_csrf_token or not hmac.compare_digest(token_hash(x_csrf_token, settings.APP_SECRET), actor["csrf_hash"]):
         raise HTTPException(403, "CSRF verification failed.")
     return actor
@@ -438,7 +460,7 @@ def _canonical_task(value: str) -> str:
 
 def _eligible_matches(conn, city, area, language, category, excluded=None):
     category = _canonical_task(category)
-    rows = conn.all("SELECT c.*,u.email FROM contributors c JOIN users u ON u.id=c.user_id WHERE c.identity_state='approved' AND c.training_complete=1 AND c.qualification_passed=1 AND c.availability=1")
+    rows = conn.all("SELECT c.*,u.email FROM contributors c JOIN users u ON u.id=c.user_id WHERE c.identity_state='approved' AND c.identity_mode='authorized_provider' AND c.approval_state='approved' AND c.training_complete=1 AND c.availability=1 AND u.is_active=1")
     candidates = []
     for row in rows:
         languages = json.loads(row["languages"])
@@ -540,6 +562,7 @@ def register(data: Registration, request: Request):
     if data.client_profile and (not data.client_profile.consent_confirmed or not data.client_profile.notification_contact_consent or not data.client_profile.family_access):
         raise HTTPException(422, "Confirm the elder's consent, notification contact permission, and visit-request access to continue.")
     ident, created = uid(), stamp()
+    email_value=data.email or f"worker-{ident}@worker.invalid"
     with db.transaction() as conn:
         account=data.family_account
         account_phone=account.phone.strip() if account else data.phone.strip() if data.phone else ""
@@ -547,7 +570,7 @@ def register(data: Registration, request: Request):
         if phone_hash and conn.one("SELECT id FROM users WHERE account_phone_hash=?",(phone_hash,)):
             raise HTTPException(409,"An account already uses that phone number. Sign in with it or use a different number.")
         inserted = conn.execute("INSERT INTO users(id,email,password_hash,role,created_at,account_name,account_phone_ciphertext,account_relationship,account_type,account_phone_hash) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(email) DO NOTHING",
-                                (ident, data.email, password_hash(data.password), data.role, created, encrypt(account.name.strip()) if account else "", encrypt(account_phone) if account_phone else None, encrypt(account.relationship.strip()) if account else "", account.account_type if account else "guardian",phone_hash))
+                                (ident, email_value, password_hash(data.password), data.role, created, encrypt(account.name.strip()) if account else "", encrypt(account_phone) if account_phone else None, encrypt(account.relationship.strip()) if account else "", account.account_type if account else "guardian",phone_hash))
         if inserted.rowcount != 1:
             raise HTTPException(409, "An account already uses that email.")
         _audit(conn, ident, "account_registered", "user", ident, {"role": data.role})
@@ -583,8 +606,12 @@ def login(data: Login, request: Request, response: Response):
                 if match:
                     conn.execute("UPDATE users SET account_phone_hash=? WHERE id=?",(hashed,match["id"]))
                     user=conn.one("SELECT * FROM users WHERE id=?",(match["id"],))
-    if not user or not user["is_active"] or not password_verify(data.password, user["password_hash"]):
+    if not user or not password_verify(data.password, user["password_hash"]):
         raise HTTPException(401, "Email or password was not accepted.")
+    if user["role"] not in {"operator", "contributor"}:
+        raise HTTPException(403, "This service now supports organisation admins and gig workers only.")
+    if not user["is_active"] and user["role"]!="contributor":
+        raise HTTPException(401,"Email or password was not accepted.")
     session, csrf = random_token(), random_token(24)
     expires = now() + timedelta(hours=settings.SESSION_HOURS)
     with db.transaction() as conn:
@@ -610,7 +637,7 @@ def logout(request: Request, response: Response, actor=Depends(_write_actor)):
 def me(actor=Depends(_actor)):
     with db.transaction() as conn:
         user=conn.one("SELECT account_name,account_phone_ciphertext,account_relationship,account_type,avatar_data_url FROM users WHERE id=?",(actor["id"],))
-    return {"id": actor["id"], "email": actor["email"], "role": actor["role"],
+    return {"id": actor["id"], "email": actor["email"], "role": actor["role"],"active":actor["active"],
             "account_type": user["account_type"] if user else "guardian",
             "account_name": decrypt(user["account_name"]) if user and user["account_name"] else "",
             "account_phone": decrypt(user["account_phone_ciphertext"]) if user and user["account_phone_ciphertext"] else "",
@@ -720,17 +747,26 @@ def update_notification_contact(profile_id: str, data: NotificationContactUpdate
 def get_contributor(actor=Depends(_actor)):
     _role(actor, "contributor", "operator")
     with db.transaction() as conn:
-        row = conn.one("SELECT c.*,u.account_phone_ciphertext FROM contributors c JOIN users u ON u.id=c.user_id WHERE c.user_id=?", (actor["id"],))
+        row = conn.one("SELECT c.*,u.account_phone_ciphertext,u.is_active,(SELECT a.email FROM users a WHERE a.id=c.training_changed_by) AS training_changed_by_email FROM contributors c JOIN users u ON u.id=c.user_id WHERE c.user_id=?", (actor["id"],))
         account=conn.one("SELECT account_phone_ciphertext FROM users WHERE id=?",(actor["id"],))
     if not row:
-        return {"status": "not_started", "identity_state": "pending", "training_complete": False, "qualification_passed": False, "availability": False,"phone":decrypt(account["account_phone_ciphertext"]) if account and account["account_phone_ciphertext"] else ""}
-    return {"user_id": row["user_id"], "display_name": decrypt(row["display_name"]), "city": decrypt(row["city"]),
-            "service_area": decrypt(row["service_area"]), "languages": json.loads(row["languages"]), "tasks": json.loads(row["tasks"]),
+        return {"status": "not_started", "identity_state": "pending", "verification_status":"verification_pending", "approval_state":"admin_review_pending", "identity_mode":"development_sandbox", "training_complete": False, "qualification_passed": False, "availability": False,"can_accept_gigs":False,"ineligibility_reasons":["Complete your worker profile."],"phone":decrypt(account["account_phone_ciphertext"]) if account and account["account_phone_ciphertext"] else ""}
+    reasons=[]
+    if row["identity_state"]!="approved": reasons.append("Identity verification is not completed.")
+    if row["identity_mode"]!="authorized_provider": reasons.append("Development sandbox identity checks cannot verify Aadhaar. Use an authorized verification provider.")
+    if row["approval_state"]!="approved": reasons.append("Admin approval is pending.")
+    if not row["training_complete"]: reasons.append("Admin has not marked training as completed.")
+    if not row["is_active"]: reasons.append("Your account is suspended.")
+    verification_status={"pending":"verification_pending","approved":"verification_completed","rejected":"verification_rejected"}.get(row["identity_state"],"verification_pending")
+    return {"user_id": row["user_id"], "display_name": decrypt(row["display_name"]), "city": decrypt(row["city"]),"status":"registered",
+            "service_area": decrypt(row["service_area"]),"address":decrypt(row["home_address_ciphertext"]) if row["home_address_ciphertext"] else "", "languages": json.loads(row["languages"]), "tasks": json.loads(row["tasks"]),
             "phone": decrypt(row["account_phone_ciphertext"]) if row["account_phone_ciphertext"] else "", "date_of_birth": row["date_of_birth"],
             "age": row["age"], "profession": decrypt(row["profession"]) if row["profession"] else "",
             "identity_document_type": row["identity_document_type"], "identity_reference_submitted": bool(row["identity_reference_ciphertext"]),
-            "identity_state": row["identity_state"], "training_complete": bool(row["training_complete"]),
-            "qualification_passed": bool(row["qualification_passed"]), "availability": bool(row["availability"]), "payout_inr": row["payout_inr"]}
+            "identity_state": row["identity_state"],"verification_status":verification_status,"identity_mode":row["identity_mode"], "approval_state":"approved" if row["approval_state"]=="approved" else "rejected" if row["approval_state"]=="rejected" else "admin_review_pending",
+            "training_complete": bool(row["training_complete"]), "training_updated_at":row["training_updated_at"],"training_changed_by":row["training_changed_by_email"],
+            "qualification_passed": bool(row["qualification_passed"]), "availability": bool(row["availability"]),
+            "can_accept_gigs":not reasons,"ineligibility_reasons":reasons,"payout_inr": row["payout_inr"]}
 
 
 @app.get("/api/contributor/reviews")
@@ -740,6 +776,18 @@ def contributor_reviews(actor=Depends(_actor)):
         _audit(conn,actor["id"],"contributor_reviews_access","feedback",actor["id"])
         rows=conn.all("SELECT f.rating,f.comment,f.created_at,b.category,b.service_date FROM feedback f JOIN bookings b ON b.id=f.booking_id WHERE b.contributor_user_id=? ORDER BY f.created_at DESC LIMIT 50",(actor["id"],))
     return rows
+
+
+@app.get("/api/contributor/earnings")
+def contributor_earnings(actor=Depends(_actor)):
+    _role(actor,"contributor")
+    today=india_now().date()
+    week_start=today-timedelta(days=today.weekday())
+    month_start=today.replace(day=1)
+    with db.transaction() as conn:
+        rows=conn.all("SELECT e.*,b.gig_title,b.category,b.service_date FROM worker_earnings e JOIN bookings b ON b.id=e.booking_id WHERE e.worker_user_id=? ORDER BY e.recorded_at DESC",(actor["id"],))
+    amount=lambda from_day,to_day=None:sum(r["amount_inr"] for r in rows if r["service_date"]>=from_day.isoformat() and (to_day is None or r["service_date"]<=to_day.isoformat()))
+    return {"completed_gigs":len(rows),"today_inr":amount(today,today),"week_inr":amount(week_start,today),"month_inr":amount(month_start,today),"total_inr":sum(r["amount_inr"] for r in rows),"pending_inr":sum(r["amount_inr"] for r in rows if r["status"]=="pending"),"paid_inr":sum(r["amount_inr"] for r in rows if r["status"]=="paid"),"items":rows}
 
 
 @app.post("/api/contributor/onboarding", status_code=201)
@@ -760,11 +808,13 @@ def contributor_onboarding(data: ContributorInput, actor=Depends(_write_actor)):
         exists = conn.one("SELECT user_id FROM contributors WHERE user_id=?", (actor["id"],))
         if exists:
             raise HTTPException(409, "Onboarding has already been submitted; ask an operator to review your record.")
-        inserted = conn.execute("INSERT INTO contributors(user_id,display_name,service_area,city,languages,tasks,identity_state,training_complete,qualification_passed,availability,payout_inr,created_at,date_of_birth,age,profession,identity_document_type,identity_reference_ciphertext) VALUES(?,?,?,?,?,?,'pending',0,0,0,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO NOTHING",
-                                (actor["id"], encrypt(data.display_name.strip()), area, city, json_dump(data.languages), json_dump(tasks), payout, stamp(), data.date_of_birth.isoformat(), age, encrypt(data.profession.strip()), data.identity_document_type, encrypt(data.identity_reference.strip())))
+        inserted = conn.execute("INSERT INTO contributors(user_id,display_name,service_area,city,languages,tasks,identity_state,training_complete,qualification_passed,availability,payout_inr,created_at,date_of_birth,age,profession,identity_document_type,identity_reference_ciphertext,identity_mode,approval_state,home_address_ciphertext) VALUES(?,?,?,?,?,?,'pending',0,0,0,?,?,?,?,?,?,?,?, 'pending',?) ON CONFLICT(user_id) DO NOTHING",
+                                (actor["id"], encrypt(data.display_name.strip()), area, city, json_dump(data.languages), json_dump(tasks), payout, stamp(), data.date_of_birth.isoformat(), age, encrypt(data.profession.strip()), data.identity_document_type, encrypt(data.identity_reference.strip()),data.identity_mode,encrypt(data.address.strip())))
         if inserted.rowcount != 1:
             raise HTTPException(409, "Onboarding has already been submitted.")
         _audit(conn, actor["id"], "contributor_onboarding_submitted", "contributor", actor["id"])
+        _org_notify(conn,"worker_registered","New worker registration",f"{data.display_name.strip()} submitted a worker profile.","contributor",actor["id"])
+        _org_notify(conn,"identity_verification_submitted","Identity verification submitted","A worker submitted an identity provider reference for restricted admin review.","contributor",actor["id"])
     return {"status": "pending_review", "identity_state": "pending", "training_complete": False, "qualification_passed": False}
 
 
@@ -779,15 +829,7 @@ def training_modules(actor=Depends(_actor)):
 @app.post("/api/contributor/training/complete")
 def training_complete(answers: list[str], actor=Depends(_write_actor)):
     _role(actor, "contributor")
-    expected = ["call emergency services and notify the coordinator", "no", "call emergency services when warranted and notify the coordinator"]
-    passed = len(answers) == 3 and all(a.strip().casefold() == e for a, e in zip(answers, expected))
-    with db.transaction() as conn:
-        row = conn.one("SELECT user_id FROM contributors WHERE user_id=?", (actor["id"],))
-        if not row:
-            raise HTTPException(409, "Complete contributor onboarding before training.")
-        conn.execute("UPDATE contributors SET training_complete=?,qualification_passed=? WHERE user_id=?", (int(passed), int(passed), actor["id"]))
-        _audit(conn, actor["id"], "training_attempt", "contributor", actor["id"], {"passed": passed})
-    return {"passed": passed, "training_complete": passed, "qualification_passed": passed, "identity_state": "pending"}
+    raise HTTPException(403,"Only an organisation admin can update training status.")
 
 
 @app.patch("/api/contributor/availability")
@@ -795,12 +837,12 @@ def contributor_availability(body: dict, actor=Depends(_write_actor)):
     _role(actor, "contributor")
     available = bool(body.get("available"))
     with db.transaction() as conn:
-        row = conn.one("SELECT identity_state,training_complete,qualification_passed FROM contributors WHERE user_id=?", (actor["id"],))
+        row = conn.one("SELECT identity_state,identity_mode,approval_state,training_complete FROM contributors WHERE user_id=?", (actor["id"],))
         if not row:
             raise HTTPException(409, "Complete onboarding first.")
-        if available and (row["identity_state"] != "approved" or not row["training_complete"] or not row["qualification_passed"]):
-            raise HTTPException(403, "Availability requires operator-approved identity review and completed training.")
-        conn.execute("UPDATE contributors SET availability=? WHERE user_id=?", (int(available), actor["id"]))
+        if available and (row["identity_state"] != "approved" or row["identity_mode"]!="authorized_provider" or row["approval_state"]!="approved" or not row["training_complete"]):
+            raise HTTPException(403, "Availability requires completed authorized identity verification, admin approval, and completed training.")
+        conn.execute("UPDATE contributors SET availability=?,availability_changed_at=? WHERE user_id=?", (int(available),stamp(), actor["id"]))
         _audit(conn, actor["id"], "contributor_availability_changed", "contributor", actor["id"], {"available": available})
     return {"availability": available}
 
@@ -817,7 +859,7 @@ def list_bookings(actor=Depends(_actor)):
         else:
             rows = conn.all("SELECT b.*,p.display_name AS person,p.phone AS client_phone,p.address_ciphertext,p.notification_name AS contact_name,p.notification_phone_ciphertext AS contact_phone FROM bookings b JOIN profiles p ON p.id=b.profile_id WHERE b.contributor_user_id=? OR (b.status IN ('searching','offered') AND (b.contributor_user_id IS NULL OR b.contributor_user_id=?) AND NOT EXISTS (SELECT 1 FROM booking_ignored i WHERE i.helper_user_id=? AND i.booking_id=b.id)) ORDER BY b.service_date,b.start_time", (actor["id"],actor["id"],actor["id"]))
             contributor=conn.one("SELECT * FROM contributors WHERE user_id=?",(actor["id"],))
-            if contributor and contributor["identity_state"]=="approved" and contributor["training_complete"] and contributor["qualification_passed"] and contributor["availability"]:
+            if contributor and contributor["identity_state"]=="approved" and contributor["identity_mode"]=="authorized_provider" and contributor["approval_state"]=="approved" and contributor["training_complete"] and contributor["availability"]:
                 rows=[row for row in rows if row["contributor_user_id"]==actor["id"] or actor["id"] in {match["user_id"] for match in _eligible_matches(conn,decrypt(row["city"]),decrypt(row["service_area"]),row["language"],row["category"])}]
             else:
                 rows=[row for row in rows if row["contributor_user_id"]==actor["id"]]
@@ -829,12 +871,14 @@ def list_bookings(actor=Depends(_actor)):
                 if booking["contributor_user_id"] and booking["helper_accepted_at"]:
                     helper_data[booking["id"]]=conn.one("SELECT c.display_name,u.account_phone_ciphertext,(SELECT AVG(f.rating) FROM feedback f JOIN bookings rb ON rb.id=f.booking_id WHERE rb.contributor_user_id=u.id) AS average_rating,(SELECT COUNT(*) FROM feedback f JOIN bookings rb ON rb.id=f.booking_id WHERE rb.contributor_user_id=u.id) AS rating_count FROM contributors c JOIN users u ON u.id=c.user_id WHERE u.id=?",(booking["contributor_user_id"],))
         progress_data={}
+        history_data={}
         if actor["role"]=="contributor":
             for booking in rows:
                 progress_data[booking["id"]]=conn.one("SELECT status,created_at FROM booking_updates WHERE booking_id=? ORDER BY created_at DESC LIMIT 1",(booking["id"],))
+                history_data[booking["id"]]=conn.all("SELECT status,created_at,helper_user_id FROM booking_updates WHERE booking_id=? ORDER BY created_at",(booking["id"],))
     result=[]
     for row in rows:
-        item={**{k: row[k] for k in ("id","profile_id","category","service_date","start_time","duration_hours","language","status","price_inr","payout_inr","payment_state","contributor_user_id","created_at")}, "person": decrypt(row["person"]), "city": decrypt(row["city"]), "service_area": decrypt(row["service_area"]),"helper_accepted":bool(row["helper_accepted_at"])}
+        item={**{k: row[k] for k in ("id","profile_id","category","service_date","start_time","duration_hours","language","status","price_inr","payout_inr","payment_state","contributor_user_id","created_at","gig_title","gig_description","required_skills","priority")}, "person": decrypt(row["person"]) if actor["role"]!="contributor" or row["contributor_user_id"]==actor["id"] else "Care recipient", "city": decrypt(row["city"]), "service_area": decrypt(row["service_area"]),"helper_accepted":bool(row["helper_accepted_at"])}
         if actor["role"]=="family":
             item["booked_by_me"]=row["customer_user_id"]==actor["id"]
             item["helper_accepted"]=bool(row["helper_accepted_at"])
@@ -846,10 +890,12 @@ def list_bookings(actor=Depends(_actor)):
         elif actor["role"]=="contributor":
             update=progress_data.get(row["id"])
             item["progress"]={"status":update["status"],"updated_at":update["created_at"]} if update else {"status":"accepted","updated_at":row["helper_accepted_at"]}
+            item["progress_history"]=history_data.get(row["id"],[])
             if row["contributor_user_id"]==actor["id"] and row["helper_accepted_at"]:
                 instructions=row["instructions"]
                 if instructions and (instructions.startswith("dpapi:v1:") or instructions.startswith("gAAAA")): instructions=decrypt(instructions)
                 item["client_details"]={"name":decrypt(row["person"]),"phone":decrypt(row["client_phone"]) if row["client_phone"] else "","address":decrypt(row["address_ciphertext"]) if row["address_ciphertext"] else decrypt(row["service_area"]),"contact_name":decrypt(row["contact_name"]) if row["contact_name"] else "","contact_phone":decrypt(row["contact_phone"]) if row["contact_phone"] else "","instructions":instructions}
+                item["client_details"]["description"]=row["gig_description"] or ""
         result.append(item)
     return result
 
@@ -915,8 +961,9 @@ def accept_booking(booking_id: str, actor=Depends(_write_actor)):
     _role(actor, "contributor")
     with db.transaction() as conn:
         person = conn.one("SELECT * FROM contributors WHERE user_id=?", (actor["id"],))
-        if not person or person["identity_state"] != "approved" or not person["training_complete"] or not person["qualification_passed"] or not person["availability"]:
-            raise HTTPException(403, "Only approved, trained, qualified, available contributors may accept bookings.")
+        user_active=conn.one("SELECT is_active FROM users WHERE id=?",(actor["id"],))["is_active"]
+        if not person or person["identity_state"] != "approved" or person["identity_mode"]!="authorized_provider" or person["approval_state"]!="approved" or not person["training_complete"] or not person["availability"] or not user_active:
+            raise HTTPException(403, "Gig eligibility requires completed authorized identity verification, admin approval, completed training, availability, and an active account.")
         row = conn.one("SELECT * FROM bookings WHERE id=?", (booking_id,))
         if not row or row["status"] not in ("searching", "offered"):
             raise HTTPException(409, "Booking is unavailable for acceptance.")
@@ -935,6 +982,7 @@ def accept_booking(booking_id: str, actor=Depends(_write_actor)):
             raise HTTPException(409, "Another contributor accepted this booking first.")
         _audit(conn, actor["id"], "booking_accepted", "booking", booking_id,{"payment_pending":row["payment_state"]!="paid"})
         _new_notification(conn, row["profile_id"], "booking_update", {"booking_id": booking_id, "status": next_status})
+        _org_notify(conn,"gig_accepted","Gig accepted",f"A worker accepted gig {booking_id}.","booking",booking_id)
     return {"id": booking_id, "status": next_status,"message":"Helper accepted. Keep the organization updated as you travel and complete the task."}
 
 
@@ -955,6 +1003,7 @@ def update_gig_progress(booking_id: str, body: dict, actor=Depends(_write_actor)
     _role(actor,"contributor")
     progress=str(body.get("status",""))
     sequence=["on_way","reached","helping","done"]
+    completion_code=str(body.get("completion_code","")) if progress=="done" else ""
     if progress not in sequence: raise HTTPException(422,"Choose a valid task update.")
     with db.transaction() as conn:
         row=conn.one("SELECT id,contributor_user_id,helper_accepted_at,status FROM bookings WHERE id=?",(booking_id,))
@@ -964,10 +1013,14 @@ def update_gig_progress(booking_id: str, body: dict, actor=Depends(_write_actor)
         expected=sequence[(sequence.index(latest["status"])+1)] if latest and latest["status"] in sequence[:-1] else "on_way" if not latest else None
         if progress!=expected:
             raise HTTPException(409,"Send task updates in order: on the way, reached, helping, then done.")
+        if progress=="done" and not hmac.compare_digest(token_hash(completion_code,settings.APP_SECRET+booking_id),conn.one("SELECT checkout_otp_hash FROM bookings WHERE id=?",(booking_id,))["checkout_otp_hash"]):
+            raise HTTPException(403,"Enter the client or organisation completion code to finish this gig.")
         created=stamp()
         conn.execute("INSERT INTO booking_updates(id,booking_id,helper_user_id,status,created_at) VALUES(?,?,?,?,?)",(uid(),booking_id,actor["id"],progress,created))
         if progress=="done": conn.execute("UPDATE bookings SET status='completed',checkout_at=?,updated_at=? WHERE id=?",(created,created,booking_id))
+        if progress=="done": conn.execute("INSERT INTO worker_earnings(id,booking_id,worker_user_id,amount_inr,status,recorded_at) VALUES(?,?,?,?,'pending',?) ON CONFLICT(booking_id) DO NOTHING",(uid(),booking_id,actor["id"],conn.one("SELECT payout_inr FROM bookings WHERE id=?",(booking_id,))["payout_inr"],created))
         _audit(conn,actor["id"],"gig_progress_updated","booking",booking_id,{"status":progress})
+        _org_notify(conn,"gig_"+progress,"Worker task update",f"A worker marked gig {booking_id}: {progress.replace('_',' ')}.","booking",booking_id)
     return {"id":booking_id,"status":progress,"updated_at":created,"organization_notified":True}
 
 
@@ -984,13 +1037,20 @@ def create_admin_gig(data: AdminGigInput, actor=Depends(_write_actor)):
     profile_id,booking_id,created=uid(),uid(),stamp()
     checkin,checkout=f"{secrets.randbelow(900000)+100000}",f"{secrets.randbelow(900000)+100000}"
     expires=stamp(datetime.combine(data.service_date,data.start_time).replace(tzinfo=ZoneInfo("Asia/Kolkata"))+timedelta(hours=data.duration_hours+4))
-    payout=round(data.fare_inr*settings.DEFAULT_CONTRIBUTOR_PAYOUT/settings.DEFAULT_HOURLY_PRICE)
+    payout=data.offered_payout_inr if data.offered_payout_inr is not None else round(data.fare_inr*settings.DEFAULT_CONTRIBUTOR_PAYOUT/settings.DEFAULT_HOURLY_PRICE)
+    assigned_worker_id=data.assigned_worker_id or None
     with db.transaction() as conn:
+        if assigned_worker_id:
+            eligible_ids={candidate["user_id"] for candidate in _eligible_matches(conn,data.city.strip(),data.service_area.strip(),data.language.strip(),category)}
+            if assigned_worker_id not in eligible_ids: raise HTTPException(422,"Select an active worker who is verified, approved, trained, available, and matches the location, language, and task.")
         conn.execute("INSERT INTO profiles(id,owner_user_id,display_name,age,phone,whatsapp_ciphertext,whatsapp_id_hash,language,city,service_area,consent_confirmed,family_access,monitoring_consent,voice_ai_consent,retention_days,created_at,notification_name,notification_phone_ciphertext,notification_relationship,notification_contact_consent,address_ciphertext) VALUES(?,?,?,NULL,?,NULL,NULL,?,?,?,?,0,0,0,30,?,?,?,?,1,?)",(profile_id,actor["id"],encrypt(data.client_name.strip()),encrypt(data.client_phone.strip()),data.language.strip(),encrypt(data.city.strip()),encrypt(data.service_area.strip()),1,created,encrypt(data.contact_name.strip()),encrypt(data.contact_phone.strip()),encrypt("Emergency contact"),encrypt(data.client_address.strip())))
-        conn.execute("INSERT INTO bookings(id,customer_user_id,profile_id,contributor_user_id,category,service_date,start_time,duration_hours,city,service_area,language,instructions,status,price_inr,payout_inr,checkin_otp_hash,checkout_otp_hash,otp_expires_at,created_at,updated_at,checkin_otp_ciphertext,checkout_otp_ciphertext,payment_state) VALUES(?,?,?,NULL,?,?,?,?,?,?,?,?, 'searching',?,?,?,?,?,?,?,?,?,'unpaid')",(booking_id,actor["id"],profile_id,category,data.service_date.isoformat(),data.start_time.strftime("%H:%M"),data.duration_hours,encrypt(data.city.strip()),encrypt(data.service_area.strip()),data.language.strip(),encrypt(data.instructions.strip()),data.fare_inr,payout,token_hash(checkin,settings.APP_SECRET+booking_id),token_hash(checkout,settings.APP_SECRET+booking_id),expires,created,created,encrypt(checkin),encrypt(checkout)))
-        _audit(conn,actor["id"],"admin_gig_created","booking",booking_id,{"category":category,"service_date":data.service_date.isoformat()})
-        _new_notification(conn,profile_id,"booking_update",{"booking_id":booking_id,"status":"searching"})
-    return {"id":booking_id,"status":"searching","profile_id":profile_id,"price_inr":data.fare_inr,"payout_inr":payout}
+        title=data.title.strip() or category
+        initial_status="offered" if assigned_worker_id else "searching"
+        conn.execute("INSERT INTO bookings(id,customer_user_id,profile_id,contributor_user_id,category,service_date,start_time,duration_hours,city,service_area,language,instructions,status,price_inr,payout_inr,checkin_otp_hash,checkout_otp_hash,otp_expires_at,created_at,updated_at,checkin_otp_ciphertext,checkout_otp_ciphertext,payment_state,gig_title,gig_description,required_skills,priority,helpers_needed) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(booking_id,actor["id"],profile_id,assigned_worker_id,category,data.service_date.isoformat(),data.start_time.strftime("%H:%M"),data.duration_hours,encrypt(data.city.strip()),encrypt(data.service_area.strip()),data.language.strip(),encrypt(data.instructions.strip()),initial_status,data.fare_inr,payout,token_hash(checkin,settings.APP_SECRET+booking_id),token_hash(checkout,settings.APP_SECRET+booking_id),expires,created,created,encrypt(checkin),encrypt(checkout),"unpaid",title,data.description.strip(),json_dump(data.required_skills),data.priority,data.helpers_needed))
+        _audit(conn,actor["id"],"admin_gig_created","booking",booking_id,{"category":category,"service_date":data.service_date.isoformat(),"assigned_worker":bool(assigned_worker_id)})
+        _new_notification(conn,profile_id,"booking_update",{"booking_id":booking_id,"status":initial_status})
+        _org_notify(conn,"gig_created","Gig published",f"{title} was published {'to a selected worker' if assigned_worker_id else 'to eligible workers'}.","booking",booking_id)
+    return {"id":booking_id,"status":initial_status,"profile_id":profile_id,"price_inr":data.fare_inr,"payout_inr":payout,"completion_code":checkout}
 
 
 @app.get("/api/admin/gigs")
@@ -1002,8 +1062,71 @@ def admin_gigs(actor=Depends(_actor)):
         result=[]
         for row in rows:
             last=conn.one("SELECT status,created_at FROM booking_updates WHERE booking_id=? ORDER BY created_at DESC LIMIT 1",(row["id"],))
-            result.append({"id":row["id"],"client":decrypt(row["person"]),"category":row["category"],"service_date":row["service_date"],"start_time":row["start_time"],"service_area":decrypt(row["service_area"]),"status":row["status"],"helper":decrypt(row["helper"]) if row["helper"] else "Awaiting helper","progress":last["status"] if last else "pending","progress_at":last["created_at"] if last else None,"fare_inr":row["price_inr"],"payout_inr":row["payout_inr"]})
+            result.append({"id":row["id"],"client":decrypt(row["person"]),"title":row["gig_title"] or row["category"],"category":row["category"],"service_date":row["service_date"],"start_time":row["start_time"],"duration_hours":row["duration_hours"],"service_area":decrypt(row["service_area"]),"status":row["status"],"helper":decrypt(row["helper"]) if row["helper"] else "Awaiting helper","progress":last["status"] if last else "pending","progress_at":last["created_at"] if last else None,"fare_inr":row["price_inr"],"payout_inr":row["payout_inr"]})
     return result
+
+
+@app.get("/api/admin/notifications")
+def organization_notifications(actor=Depends(_actor), limit:int=100):
+    _role(actor,"operator")
+    with db.transaction() as conn:
+        rows=conn.all("SELECT * FROM organization_notifications ORDER BY created_at DESC LIMIT ?",(max(1,min(limit,250)),))
+        return rows
+
+
+@app.post("/api/admin/notifications/{notification_id}/read")
+def mark_organization_notification_read(notification_id:str,actor=Depends(_write_actor)):
+    _role(actor,"operator")
+    with db.transaction() as conn:
+        result=conn.execute("UPDATE organization_notifications SET read_at=COALESCE(read_at,?) WHERE id=?",(stamp(),notification_id))
+        if result.rowcount!=1: raise HTTPException(404,"Notification not found.")
+        _audit(conn,actor["id"],"organization_notification_read","notification",notification_id)
+    return {"id":notification_id,"read":True}
+
+
+@app.post("/api/admin/earnings/{earning_id}/mark-paid")
+def mark_worker_earning_paid(earning_id:str,body:dict,actor=Depends(_write_actor)):
+    _role(actor,"operator")
+    reference=str(body.get("payment_reference","")).strip()
+    if len(reference)<3 or len(reference)>160: raise HTTPException(422,"Record a payment confirmation or settlement reference.")
+    with db.transaction() as conn:
+        row=conn.one("SELECT * FROM worker_earnings WHERE id=?",(earning_id,))
+        if not row: raise HTTPException(404,"Earning record not found.")
+        if row["status"]=="paid": return {"id":earning_id,"status":"paid","paid_at":row["paid_at"]}
+        paid_at=stamp()
+        conn.execute("UPDATE worker_earnings SET status='paid',paid_at=?,paid_by=?,payment_reference=? WHERE id=? AND status='pending'",(paid_at,actor["id"],reference,earning_id))
+        _audit(conn,actor["id"],"worker_earning_marked_paid","worker_earning",earning_id,{"payment_reference":reference})
+        _org_notify(conn,"worker_payout","Worker payout recorded",f"Payout for worker {row['worker_user_id']} was recorded as paid.","worker_earning",earning_id)
+    return {"id":earning_id,"status":"paid","paid_at":paid_at}
+
+
+@app.get("/api/admin/earnings")
+def admin_worker_earnings(actor=Depends(_actor)):
+    _role(actor,"operator")
+    with db.transaction() as conn:
+        rows=conn.all("SELECT e.*,c.display_name AS worker_name,b.gig_title,b.category FROM worker_earnings e JOIN contributors c ON c.user_id=e.worker_user_id JOIN bookings b ON b.id=e.booking_id ORDER BY e.recorded_at DESC LIMIT 250")
+        _audit(conn,actor["id"],"worker_earnings_access","worker_earnings","all",{"count":len(rows)})
+        return [{"id":row["id"],"worker_user_id":row["worker_user_id"],"worker":decrypt(row["worker_name"]),"gig":row["gig_title"] or row["category"],"amount_inr":row["amount_inr"],"status":row["status"],"recorded_at":row["recorded_at"],"paid_at":row["paid_at"],"payment_reference":row["payment_reference"]} for row in rows]
+
+
+@app.post("/api/admin/gigs/{booking_id}/complete-exception")
+def complete_gig_exception(booking_id:str,body:dict,actor=Depends(_write_actor)):
+    _role(actor,"operator")
+    reason=str(body.get("reason","")).strip()
+    if len(reason)<10 or len(reason)>1000: raise HTTPException(422,"Record at least 10 characters explaining the human completion exception.")
+    with db.transaction() as conn:
+        row=conn.one("SELECT * FROM bookings WHERE id=?",(booking_id,))
+        if not row: raise HTTPException(404,"Gig not found.")
+        latest=conn.one("SELECT status FROM booking_updates WHERE booking_id=? ORDER BY created_at DESC LIMIT 1",(booking_id,))
+        if row["status"] in {"completed","cancelled"} or not row["contributor_user_id"] or not latest or latest["status"]!="helping":
+            raise HTTPException(409,"Exception completion is available only for an assigned gig currently marked Helping.")
+        completed_at=stamp()
+        conn.execute("INSERT INTO booking_updates(id,booking_id,helper_user_id,status,created_at) VALUES(?,?,?,'done',?)",(uid(),booking_id,row["contributor_user_id"],completed_at))
+        conn.execute("UPDATE bookings SET status='completed',checkout_at=?,updated_at=? WHERE id=?",(completed_at,completed_at,booking_id))
+        conn.execute("INSERT INTO worker_earnings(id,booking_id,worker_user_id,amount_inr,status,recorded_at) VALUES(?,?,?,?,'pending',?) ON CONFLICT(booking_id) DO NOTHING",(uid(),booking_id,row["contributor_user_id"],row["payout_inr"],completed_at))
+        _audit(conn,actor["id"],"gig_completed_by_exception","booking",booking_id,{"reason":reason,"assigned_worker_id":row["contributor_user_id"]})
+        _org_notify(conn,"gig_completion_exception","Gig completed by admin exception",f"Admin completed gig {booking_id} after a documented code exception.","booking",booking_id)
+    return {"id":booking_id,"status":"completed","completion_exception":True}
 
 
 @app.post("/api/bookings/{booking_id}/cancel")
@@ -1015,7 +1138,7 @@ def cancel_booking(booking_id: str, actor=Depends(_write_actor)):
             raise HTTPException(403, "Only the assigned contributor may cancel this booking.")
         if row["status"] in ("completed", "cancelled", "in_progress"):
             raise HTTPException(409, "This booking cannot be cancelled in its current state.")
-        if actor["role"] == "family":
+        if actor["role"] in {"family","operator"}:
             new_contributor, status = None, "cancelled"
         else:
             replacement = _eligible_matches(conn, decrypt(row["city"]), decrypt(row["service_area"]), row["language"], row["category"].lower(), row["contributor_user_id"])
@@ -1027,6 +1150,7 @@ def cancel_booking(booking_id: str, actor=Depends(_write_actor)):
         conn.execute("INSERT INTO cancellation_events(id,booking_id,initiated_by,cancelled_contributor_id,replacement_contributor_id,result,created_at) VALUES(?,?,?,?,?,?,?)", (uid(),booking_id,actor["id"],row["contributor_user_id"],new_contributor,status,stamp()))
         _audit(conn, actor["id"], "booking_cancelled_replacement_search", "booking", booking_id, {"reassigned": bool(new_contributor), "partner_adapter_configured": settings.configured_provider("partner")})
         _new_notification(conn, row["profile_id"], "booking_update", {"booking_id": booking_id, "status": status})
+        _org_notify(conn,"gig_cancelled","Gig cancelled",f"Gig {booking_id} was cancelled by {actor['role']}.","booking",booking_id)
     return {"id": booking_id, "status": status, "replacement_contributor_id": new_contributor,
             "partner_fallback": "BLOCKED: requires configured approved partner network" if not new_contributor else "not_needed"}
 
@@ -1069,7 +1193,9 @@ def check_out(booking_id: str, body: dict, actor=Depends(_write_actor)):
             _audit(conn, actor["id"], "check_out_otp_rejected", "booking", booking_id)
             raise HTTPException(422, "Check-out OTP is invalid.")
         conn.execute("UPDATE bookings SET status='completed',checkout_at=?,updated_at=? WHERE id=?", (stamp(), stamp(), booking_id))
+        conn.execute("INSERT INTO worker_earnings(id,booking_id,worker_user_id,amount_inr,status,recorded_at) VALUES(?,?,?,?,'pending',?) ON CONFLICT(booking_id) DO NOTHING",(uid(),booking_id,actor["id"],row["payout_inr"],stamp()))
         _audit(conn, actor["id"], "booking_completed", "booking", booking_id, {"payout_inr": row["payout_inr"]})
+        _org_notify(conn,"gig_done","Worker completed the gig",f"Worker completed gig {booking_id}.","booking",booking_id)
     return {"id": booking_id, "status": "completed", "payout_state": "pending_payment_settlement"}
 
 
@@ -1463,24 +1589,50 @@ def admin_contributors(actor=Depends(_actor)):
     _role(actor, "operator")
     with db.transaction() as conn:
         _audit(conn, actor["id"], "contributor_queue_access", "contributors", "all")
-        rows = conn.all("SELECT c.*,u.account_phone_ciphertext FROM contributors c JOIN users u ON u.id=c.user_id ORDER BY c.created_at")
-        return [{"user_id": r["user_id"], "display_name": decrypt(r["display_name"]), "date_of_birth": r["date_of_birth"], "age": r["age"], "profession": decrypt(r["profession"]) if r["profession"] else "", "phone": decrypt(r["account_phone_ciphertext"]) if r["account_phone_ciphertext"] else "", "identity_document_type": r["identity_document_type"], "identity_reference": decrypt(r["identity_reference_ciphertext"]) if r["identity_reference_ciphertext"] else "", "city": decrypt(r["city"]), "service_area": decrypt(r["service_area"]), "languages": json.loads(r["languages"]), "tasks": json.loads(r["tasks"]), "identity_state": r["identity_state"], "training_complete": bool(r["training_complete"]), "qualification_passed": bool(r["qualification_passed"]), "availability": bool(r["availability"])} for r in rows]
+        rows = conn.all("SELECT c.*,u.account_phone_ciphertext,u.is_active,(SELECT a.email FROM users a WHERE a.id=c.training_changed_by) AS training_changed_by_email FROM contributors c JOIN users u ON u.id=c.user_id ORDER BY c.created_at")
+        return [{"user_id": r["user_id"], "display_name": decrypt(r["display_name"]), "date_of_birth": r["date_of_birth"], "age": r["age"], "profession": decrypt(r["profession"]) if r["profession"] else "", "phone": decrypt(r["account_phone_ciphertext"]) if r["account_phone_ciphertext"] else "", "address":decrypt(r["home_address_ciphertext"]) if r["home_address_ciphertext"] else "", "identity_document_type": r["identity_document_type"], "identity_reference": decrypt(r["identity_reference_ciphertext"]) if r["identity_reference_ciphertext"] else "", "identity_mode":r["identity_mode"],"identity_state": r["identity_state"],"approval_state":r["approval_state"], "training_complete": bool(r["training_complete"]),"training_updated_at":r["training_updated_at"],"training_changed_by":r["training_changed_by_email"],"active":bool(r["is_active"]), "city": decrypt(r["city"]), "service_area": decrypt(r["service_area"]), "languages": json.loads(r["languages"]), "tasks": json.loads(r["tasks"]), "availability": bool(r["availability"])} for r in rows]
+
+
+@app.get("/api/admin/eligible-workers")
+def eligible_workers(city:str,area:str,category:str,language:str,actor=Depends(_actor)):
+    _role(actor,"operator")
+    if not all(x.strip() for x in (city,area,category,language)): return []
+    with db.transaction() as conn:
+        rows=_eligible_matches(conn,city.strip(),area.strip(),language.strip(),category.strip())
+        return [{"user_id":row["user_id"],"name":decrypt(row["display_name"])} for row in rows]
 
 
 @app.patch("/api/admin/contributors/{contributor_id}")
 def review_contributor(contributor_id: str, body: dict, actor=Depends(_write_actor)):
     _role(actor, "operator")
-    state = body.get("identity_state")
-    if state not in {"approved", "rejected", "pending"}:
-        raise HTTPException(422, "Invalid identity review state.")
+    identity_state=body.get("identity_state")
+    approval_state=body.get("approval_state")
+    training=body.get("training_complete")
+    active=body.get("active")
+    if identity_state is not None and identity_state not in {"approved","rejected","pending"}: raise HTTPException(422,"Invalid identity verification state.")
+    if approval_state is not None and approval_state not in {"approved","rejected","pending"}: raise HTTPException(422,"Invalid admin approval state.")
+    if training is not None and not isinstance(training,bool): raise HTTPException(422,"Training status must be completed or not completed.")
+    if active is not None and not isinstance(active,bool): raise HTTPException(422,"Account status must be active or suspended.")
     with db.transaction() as conn:
         row = conn.one("SELECT * FROM contributors WHERE user_id=?", (contributor_id,))
         if not row:
             raise HTTPException(404, "Contributor not found.")
-        available = 0 if state != "approved" else row["availability"]
-        conn.execute("UPDATE contributors SET identity_state=?,availability=? WHERE user_id=?", (state, available, contributor_id))
-        _audit(conn, actor["id"], "contributor_identity_review", "contributor", contributor_id, {"identity_state": state})
-    return {"user_id": contributor_id, "identity_state": state}
+        if identity_state=="approved" and row["identity_mode"]!="authorized_provider": raise HTTPException(409,"A development sandbox result cannot be marked as verified. Record evidence checked through an authorized provider.")
+        if approval_state=="approved" and (identity_state or row["identity_state"])!="approved": raise HTTPException(409,"Complete identity verification before approving this worker.")
+        next_identity=identity_state or row["identity_state"]
+        next_approval=approval_state or row["approval_state"]
+        next_training=int(training if training is not None else row["training_complete"])
+        next_active=int(active if active is not None else conn.one("SELECT is_active FROM users WHERE id=?",(contributor_id,))["is_active"])
+        eligible=next_identity=="approved" and row["identity_mode"]=="authorized_provider" and next_approval=="approved" and bool(next_training) and bool(next_active)
+        has_training_change=training is not None
+        conn.execute("UPDATE contributors SET identity_state=?,approval_state=?,training_complete=?,training_changed_by=CASE WHEN ? THEN ? ELSE training_changed_by END,training_updated_at=CASE WHEN ? THEN ? ELSE training_updated_at END,availability=CASE WHEN ? THEN availability ELSE 0 END WHERE user_id=?", (next_identity,next_approval,next_training,has_training_change,actor["id"],has_training_change,stamp() if has_training_change else stamp(),int(eligible),contributor_id))
+        conn.execute("UPDATE users SET is_active=? WHERE id=?",(next_active,contributor_id))
+        changes={"identity_state":next_identity,"approval_state":next_approval,"training_complete":bool(next_training),"active":bool(next_active)}
+        _audit(conn, actor["id"], "contributor_review_updated", "contributor", contributor_id, changes)
+        if identity_state is not None: _org_notify(conn,"identity_review","Worker identity review updated",f"Identity status for worker {contributor_id}: {next_identity}.","contributor",contributor_id)
+        if approval_state is not None: _org_notify(conn,"worker_approval","Worker approval updated",f"Admin approval for worker {contributor_id}: {next_approval}.","contributor",contributor_id)
+        if training is not None: _org_notify(conn,"training_status","Worker training updated",f"Training marked {'completed' if training else 'not completed'} for worker {contributor_id}.","contributor",contributor_id)
+    return {"user_id": contributor_id,**changes,"eligible":bool(eligible)}
 
 
 @app.get("/api/admin/analytics")
@@ -1494,10 +1646,21 @@ def analytics(actor=Depends(_actor)):
         cancel = conn.one("SELECT COUNT(*) AS total,SUM(CASE WHEN c.result='offered' THEN 1 ELSE 0 END) AS recovered FROM cancellation_events c JOIN users u ON u.id=c.initiated_by WHERE u.role='contributor'")
         match_events = conn.all("SELECT b.created_at,a.created_at AS accepted_at FROM bookings b JOIN audit_log a ON a.entity_type='booking' AND a.entity_id=b.id AND a.action='booking_accepted' WHERE b.status='completed'")
         avg_op_minutes = conn.one("SELECT AVG(CAST(json_extract(metadata,'$.operator_minutes') AS REAL)) AS minutes FROM audit_log WHERE json_extract(metadata,'$.operator_minutes') IS NOT NULL") if conn.dialect == "sqlite" else {"minutes": None}
+        gig_counts=conn.one("SELECT SUM(CASE WHEN status IN ('searching','offered') THEN 1 ELSE 0 END) AS pending,SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,SUM(CASE WHEN helper_accepted_at IS NOT NULL THEN 1 ELSE 0 END) AS accepted,AVG(CASE WHEN helper_accepted_at IS NOT NULL THEN (julianday(helper_accepted_at)-julianday(created_at))*86400 END) AS avg_accept_seconds,AVG(CASE WHEN status='completed' AND checkin_at IS NOT NULL AND checkout_at IS NOT NULL THEN (julianday(checkout_at)-julianday(checkin_at))*3600 END) AS avg_service_seconds FROM bookings") if conn.dialect=="sqlite" else conn.one("SELECT SUM(CASE WHEN status IN ('searching','offered') THEN 1 ELSE 0 END) AS pending,SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,SUM(CASE WHEN helper_accepted_at IS NOT NULL THEN 1 ELSE 0 END) AS accepted,AVG(EXTRACT(EPOCH FROM (helper_accepted_at::timestamptz-created_at::timestamptz))) AS avg_accept_seconds,AVG(EXTRACT(EPOCH FROM (checkout_at::timestamptz-checkin_at::timestamptz))) AS avg_service_seconds FROM bookings")
+        service_duration=conn.one("SELECT AVG((julianday(done.created_at)-julianday(helping.created_at))*86400) AS seconds FROM booking_updates done JOIN booking_updates helping ON helping.booking_id=done.booking_id WHERE done.status='done' AND helping.status='helping'") if conn.dialect=="sqlite" else conn.one("SELECT AVG(EXTRACT(EPOCH FROM (done.created_at::timestamptz-helping.created_at::timestamptz))) AS seconds FROM booking_updates done JOIN booking_updates helping ON helping.booking_id=done.booking_id WHERE done.status='done' AND helping.status='helping'")
+        onboarding=conn.one("SELECT COUNT(*) AS registered,SUM(CASE WHEN identity_state='approved' AND identity_mode='authorized_provider' THEN 1 ELSE 0 END) AS verified,SUM(CASE WHEN approval_state='approved' THEN 1 ELSE 0 END) AS approved,SUM(CASE WHEN training_complete=1 THEN 1 ELSE 0 END) AS trained FROM contributors")
+        trends=conn.all("SELECT substr(created_at,1,7) AS month,COUNT(*) AS created,SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled FROM bookings GROUP BY substr(created_at,1,7) ORDER BY month DESC LIMIT 12")
+        earnings=conn.one("SELECT COALESCE(SUM(CASE WHEN status='pending' THEN amount_inr ELSE 0 END),0) AS pending,COALESCE(SUM(CASE WHEN status='paid' THEN amount_inr ELSE 0 END),0) AS paid FROM worker_earnings")
         _audit(conn, actor["id"], "operational_analytics_access", "analytics", "summary")
     bookings = totals["bookings"] or 0
     completed = totals["completed"] or 0
     return {"source": "database records", **platform_counts, "bookings": bookings, "completed": completed,
+            "pending_gigs":gig_counts["pending"] or 0,"cancelled_gigs":gig_counts["cancelled"] or 0,"accepted_gigs":gig_counts["accepted"] or 0,
+            "registered_helpers":onboarding["registered"] or 0,"verified_helpers":onboarding["verified"] or 0,"approved_helpers":onboarding["approved"] or 0,"trained_helpers":onboarding["trained"] or 0,
+            "average_acceptance_seconds":gig_counts["avg_accept_seconds"],"average_service_seconds":service_duration["seconds"] if service_duration["seconds"] is not None else gig_counts["avg_service_seconds"],
+            "gig_creation_trends":list(reversed(trends)),"pending_payout_inr":earnings["pending"],"paid_payout_inr":earnings["paid"],
+            "gig_acceptance_rate":round((gig_counts["accepted"] or 0)/bookings,3) if bookings else None,
+            "gig_completion_rate":round(completed/bookings,3) if bookings else None,
             "fulfilment_rate": round(completed/bookings, 3) if bookings else None,
             "unfilled": totals["unfilled"] or 0, "customer_charges_inr": totals["customer_cost"],
             "contributor_compensation_inr": totals["contributor_compensation"],
@@ -1845,7 +2008,9 @@ def admin_overview(actor=Depends(_actor)):
     with db.transaction() as conn:
         stats = {
             "bookings": conn.one("SELECT COUNT(*) AS n FROM bookings WHERE status NOT IN ('completed','cancelled')")["n"],
-            "contributors_available": conn.one("SELECT COUNT(*) AS n FROM contributors WHERE identity_state='approved' AND training_complete=1 AND qualification_passed=1 AND availability=1")["n"],
+            "contributors_available": conn.one("SELECT COUNT(*) AS n FROM contributors c JOIN users u ON u.id=c.user_id WHERE c.identity_state='approved' AND c.identity_mode='authorized_provider' AND c.approval_state='approved' AND c.training_complete=1 AND c.availability=1 AND u.is_active=1")["n"],
+            "helpers_pending_approval":conn.one("SELECT COUNT(*) AS n FROM contributors WHERE approval_state='pending'")["n"],
+            "helpers_suspended":conn.one("SELECT COUNT(*) AS n FROM contributors c JOIN users u ON u.id=c.user_id WHERE u.is_active=0")["n"],
             "alerts_open": conn.one("SELECT COUNT(*) AS n FROM alerts WHERE status!='closed'")["n"],
             "incidents_open": conn.one("SELECT COUNT(*) AS n FROM incidents WHERE status='open'")["n"],
             "community_requests_pending":conn.one("SELECT COUNT(*) AS n FROM community_requests WHERE status='pending'")["n"],
