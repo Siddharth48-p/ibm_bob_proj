@@ -23,6 +23,28 @@ from . import db
 from .crypto import decrypt, encrypt, decrypt_token, encrypt_token
 from .security import password_hash, password_verify, random_token, token_hash, verify_signature
 
+UDUPI_DISTRICT = "Udupi"
+UDUPI_SERVICE_AREAS = (
+    "Udupi", "Manipal", "Malpe", "Brahmavar", "Kaup", "Padubidri",
+    "Karkala", "Hebri", "Kundapura", "Byndoor", "Shirva", "Kota",
+    "Parkala", "Indrali", "Alevoor", "Santhekatte", "Katapady", "Perdoor", "Hiriadka",
+)
+_UDUPI_AREA_LOOKUP = {area.casefold(): area for area in UDUPI_SERVICE_AREAS}
+_UDUPI_AREA_LOOKUP["kapu"] = "Kaup"
+
+
+def _validate_udupi_district(value: str) -> str:
+    if value.strip().casefold() not in {"udupi", "udupi district"}:
+        raise ValueError("CareCircle is currently serving Udupi district only.")
+    return UDUPI_DISTRICT
+
+
+def _validate_udupi_area(value: str) -> str:
+    area = _UDUPI_AREA_LOOKUP.get(value.strip().casefold())
+    if not area:
+        raise ValueError("Choose a service area within Udupi district.")
+    return area
+
 
 def now() -> datetime:
     return datetime.now(timezone.utc)
@@ -237,6 +259,16 @@ class ContributorInput(BaseModel):
     languages: list[str] = Field(min_length=1, max_length=5)
     tasks: list[str] = Field(min_length=1, max_length=8)
 
+    @field_validator("city")
+    @classmethod
+    def worker_city_is_udupi(cls, value):
+        return _validate_udupi_district(value)
+
+    @field_validator("service_area")
+    @classmethod
+    def worker_area_is_udupi(cls, value):
+        return _validate_udupi_area(value)
+
     @field_validator("identity_reference")
     @classmethod
     def identity_reference_is_not_aadhaar(cls, value):
@@ -269,6 +301,16 @@ class AdminGigInput(BaseModel):
     helpers_needed: int = Field(default=1, ge=1, le=1)
     assigned_worker_id: str | None = None
     consent_confirmed: bool
+
+    @field_validator("city")
+    @classmethod
+    def gig_city_is_udupi(cls, value):
+        return _validate_udupi_district(value)
+
+    @field_validator("service_area")
+    @classmethod
+    def gig_area_is_udupi(cls, value):
+        return _validate_udupi_area(value)
 
     @field_validator("client_phone", "contact_phone")
     @classmethod
@@ -458,16 +500,28 @@ def _canonical_task(value: str) -> str:
     return {"errand support":"errands","errand":"errands","walking accompaniment":"walking","walk":"walking","walks":"walking","meal":"meal assistance","medication reminder":"medication reminder","medicine reminder":"medication reminder"}.get(key,key)
 
 
-def _eligible_matches(conn, city, area, language, category, excluded=None):
+def _eligible_matches(conn, city, area, language, category, excluded=None, include_unavailable=False):
+    try:
+        city = _validate_udupi_district(city)
+        _validate_udupi_area(area)
+    except ValueError:
+        return []
     category = _canonical_task(category)
-    rows = conn.all("SELECT c.*,u.email FROM contributors c JOIN users u ON u.id=c.user_id WHERE c.identity_state='approved' AND c.identity_mode='authorized_provider' AND c.approval_state='approved' AND c.training_complete=1 AND c.availability=1 AND u.is_active=1")
+    availability_clause = "" if include_unavailable else " AND c.availability=1"
+    rows = conn.all(f"SELECT c.*,u.email FROM contributors c JOIN users u ON u.id=c.user_id WHERE c.identity_state='approved' AND c.identity_mode='authorized_provider' AND c.approval_state='approved' AND c.training_complete=1{availability_clause} AND u.is_active=1")
     candidates = []
     for row in rows:
         languages = json.loads(row["languages"])
         tasks = {_canonical_task(task) for task in json.loads(row["tasks"])}
         if row["user_id"] == excluded or category not in tasks:
             continue
-        if decrypt(row["city"]).casefold() != city.casefold() or decrypt(row["service_area"]).casefold() != area.casefold():
+        # For this pilot, workers can see gigs anywhere in Udupi district. The
+        # locality remains visible in the offer so they can decide whether to travel.
+        if decrypt(row["city"]).casefold() != city.casefold():
+            continue
+        try:
+            _validate_udupi_area(decrypt(row["service_area"]))
+        except ValueError:
             continue
         if language.casefold() not in [x.casefold() for x in languages]:
             continue
@@ -859,8 +913,10 @@ def list_bookings(actor=Depends(_actor)):
         else:
             rows = conn.all("SELECT b.*,p.display_name AS person,p.phone AS client_phone,p.address_ciphertext,p.notification_name AS contact_name,p.notification_phone_ciphertext AS contact_phone FROM bookings b JOIN profiles p ON p.id=b.profile_id WHERE b.contributor_user_id=? OR (b.status IN ('searching','offered') AND (b.contributor_user_id IS NULL OR b.contributor_user_id=?) AND NOT EXISTS (SELECT 1 FROM booking_ignored i WHERE i.helper_user_id=? AND i.booking_id=b.id)) ORDER BY b.service_date,b.start_time", (actor["id"],actor["id"],actor["id"]))
             contributor=conn.one("SELECT * FROM contributors WHERE user_id=?",(actor["id"],))
-            if contributor and contributor["identity_state"]=="approved" and contributor["identity_mode"]=="authorized_provider" and contributor["approval_state"]=="approved" and contributor["training_complete"] and contributor["availability"]:
-                rows=[row for row in rows if row["contributor_user_id"]==actor["id"] or actor["id"] in {match["user_id"] for match in _eligible_matches(conn,decrypt(row["city"]),decrypt(row["service_area"]),row["language"],row["category"])}]
+            if contributor and contributor["identity_state"]=="approved" and contributor["identity_mode"]=="authorized_provider" and contributor["approval_state"]=="approved" and contributor["training_complete"]:
+                # Offline workers can browse matching offers, but accept_booking
+                # still requires availability to be turned on.
+                rows=[row for row in rows if row["contributor_user_id"]==actor["id"] or actor["id"] in {match["user_id"] for match in _eligible_matches(conn,decrypt(row["city"]),decrypt(row["service_area"]),row["language"],row["category"],include_unavailable=True)}]
             else:
                 rows=[row for row in rows if row["contributor_user_id"]==actor["id"]]
         if actor["role"] == "operator":
@@ -969,7 +1025,13 @@ def accept_booking(booking_id: str, actor=Depends(_write_actor)):
             raise HTTPException(409, "Booking is unavailable for acceptance.")
         if row["contributor_user_id"] and row["contributor_user_id"] != actor["id"]:
             raise HTTPException(409, "This booking offer is assigned to another contributor.")
-        if decrypt(person["city"]).casefold() != decrypt(row["city"]).casefold() or decrypt(person["service_area"]).casefold() != decrypt(row["service_area"]).casefold():
+        try:
+            worker_district = _validate_udupi_district(decrypt(person["city"]))
+            gig_district = _validate_udupi_district(decrypt(row["city"]))
+            _validate_udupi_area(decrypt(row["service_area"]))
+        except ValueError:
+            raise HTTPException(403, "This gig is outside the Udupi district service area.")
+        if worker_district != gig_district:
             raise HTTPException(403, "Contributor is outside the requested service area.")
         task_key = _canonical_task(row["category"])
         if task_key not in {_canonical_task(task) for task in json.loads(person["tasks"])}:

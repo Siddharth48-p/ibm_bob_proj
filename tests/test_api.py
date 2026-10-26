@@ -52,10 +52,10 @@ class GigWorkflowTests(unittest.TestCase):
         self.assertEqual(response.status_code,201,response.text)
         self.login(client,email,'Secure-test-password-491!')
         onboarding=client.post('/api/contributor/onboarding',json={
-            'display_name':email.split('@')[0].title(),'address':'42 Worker Home Street, Bengaluru','date_of_birth':'1988-04-12','profession':'Care assistant',
+            'display_name':email.split('@')[0].title(),'address':'42 Worker Home Street, Manipal, Udupi','date_of_birth':'1988-04-12','profession':'Care assistant',
             'identity_document_type':'Authorized Aadhaar provider reference','identity_mode':identity_mode,
-            'identity_reference':DEV_IDENTITY_FIXTURE,'identity_consent':True,'city':'Bengaluru',
-            'service_area':'Jayanagar','languages':['Kannada'],'tasks':['companionship']})
+            'identity_reference':DEV_IDENTITY_FIXTURE,'identity_consent':True,'city':'Udupi',
+            'service_area':'Manipal','languages':['Kannada'],'tasks':['companionship']})
         self.assertEqual(onboarding.status_code,201,onboarding.text)
         return response.json()['id']
 
@@ -64,13 +64,13 @@ class GigWorkflowTests(unittest.TestCase):
         self.login(client,'operator@test.invalid','Operator-test-password-473!')
         return client.patch(f'/api/admin/contributors/{worker_id}',json=changes)
 
-    def create_gig(self,client=None,title='Companion walk',assigned_worker_id=None):
+    def create_gig(self,client=None,title='Companion walk',assigned_worker_id=None,service_area='Manipal'):
         client=client or self.client
         day=(service.india_now().date()+timedelta(days=1)).isoformat()
         response=client.post('/api/admin/gigs',json={
             'title':title,'description':'A short supervised walk in the neighbourhood.',
-            'client_name':'Test Elder','client_phone':'+919811122233','client_address':'12 Sample Road, Jayanagar, Bengaluru',
-            'contact_name':'Care contact','contact_phone':'+919822233344','city':'Bengaluru','service_area':'Jayanagar',
+            'client_name':'Test Elder','client_phone':'+919811122233','client_address':f'12 Sample Road, {service_area}, Udupi',
+            'contact_name':'Care contact','contact_phone':'+919822233344','city':'Udupi','service_area':service_area,
             'category':'Companionship','service_date':day,'start_time':'10:00','duration_hours':1,
             'fare_inr':300,'offered_payout_inr':240,'language':'Kannada','instructions':'Meet at the front entrance.',
             'required_skills':['companionship'],'priority':'standard','helpers_needed':1,'assigned_worker_id':assigned_worker_id,'consent_confirmed':True})
@@ -136,7 +136,7 @@ class GigWorkflowTests(unittest.TestCase):
         accepted=self.client.post(f"/api/bookings/{gig['id']}/accept",json={})
         self.assertEqual(accepted.status_code,200,accepted.text)
         assigned=self.client.get('/api/bookings').json()[0]
-        self.assertEqual(assigned['client_details']['address'],'12 Sample Road, Jayanagar, Bengaluru')
+        self.assertEqual(assigned['client_details']['address'],'12 Sample Road, Manipal, Udupi')
         self.assertEqual(self.client.post(f"/api/bookings/{gig['id']}/progress",json={'status':'reached'}).status_code,409)
         for status in ('on_way','reached','helping'):
             self.clock+=timedelta(seconds=1)
@@ -226,6 +226,33 @@ class GigWorkflowTests(unittest.TestCase):
         self.assertEqual([row['id'] for row in rows],[gig['id']])
         accepted=self.client.post(f"/api/bookings/{gig['id']}/accept",json={})
         self.assertEqual(accepted.status_code,200,accepted.text)
+
+    def test_udupi_workers_can_see_gigs_across_localities_in_the_district(self):
+        worker=self.register_worker('udupi-worker@test.invalid')
+        self.client.post('/api/auth/logout')
+        self.review_worker(worker,identity_state='approved',approval_state='approved',training_complete=True)
+        self.client.post('/api/auth/logout')
+        self.login(self.client,'udupi-worker@test.invalid','Secure-test-password-491!')
+        self.client.post('/api/auth/logout')
+        self.login(self.client,'operator@test.invalid','Operator-test-password-473!')
+        gig=self.create_gig(title='Malpe locality gig',service_area='Malpe')
+        self.client.post('/api/auth/logout')
+        self.login(self.client,'udupi-worker@test.invalid','Secure-test-password-491!')
+        self.assertIn(gig['id'],[row['id'] for row in self.client.get('/api/bookings').json()])
+        self.assertEqual(self.client.post(f"/api/bookings/{gig['id']}/accept",json={}).status_code,403)
+        self.assertEqual(self.client.patch('/api/contributor/availability',json={'available':True}).status_code,200)
+        self.assertEqual(self.client.post(f"/api/bookings/{gig['id']}/accept",json={}).status_code,200)
+
+    def test_admin_cannot_publish_a_gig_outside_udupi_district(self):
+        self.login(self.client,'operator@test.invalid','Operator-test-password-473!')
+        payload={
+            'title':'Out of district gig','description':'Must be rejected by the Udupi pilot boundary.',
+            'client_name':'Test Client','client_phone':'+919811122233','client_address':'12 Sample Road, Bengaluru',
+            'contact_name':'Care contact','contact_phone':'+919822233344','city':'Bengaluru','service_area':'Jayanagar',
+            'category':'Companionship','service_date':(service.india_now().date()+timedelta(days=1)).isoformat(),
+            'start_time':'10:00','duration_hours':1,'fare_inr':300,'language':'Kannada','consent_confirmed':True,
+        }
+        self.assertEqual(self.client.post('/api/admin/gigs',json=payload).status_code,422)
 
     def test_admin_can_cancel_an_unassigned_gig(self):
         self.login(self.client,'operator@test.invalid','Operator-test-password-473!')

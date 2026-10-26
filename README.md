@@ -4,6 +4,8 @@ CareCircle is a mobile-first organisation and gig-worker platform for coordinati
 
 The interface continues to use the existing CareCircle palette: `#4CAF50`, `#FFC107`, `#FFFFFF`, `#607D8B`, and `#212121`.
 
+The current service area is **Udupi district only**. Worker onboarding and gig creation use a district-fixed Udupi selector and supported localities: Udupi, Manipal, Malpe, Brahmavar, Kaup, Padubidri, Karkala, Hebri, Kundapura, Byndoor, Shirva, Kota, Parkala, Indrali, Alevoor, Santhekatte, Katapady, Perdoor, and Hiriadka. Eligible workers can see gigs across the district; the locality is shown in each offer.
+
 ## Run locally on Windows
 
 For a local SQLite preview:
@@ -65,7 +67,7 @@ Remove the bootstrap password from the environment after use. Production refuses
 - Aadhaar identity verification through an authorized provider reference that an admin checks through the provider’s authorized channel. Full Aadhaar numbers, unmasked images, and biometrics are not accepted or stored.
 - An explicit **Development sandbox** option. Sandbox results are always labelled as such and are blocked from identity approval and gig eligibility.
 - Separate identity verification, organisation approval, admin-controlled training status, account suspension/reactivation, and worker availability. Training changes record the admin and timestamp.
-- Server-side gig eligibility: authorized identity verification, admin approval, training completed, and active account. The worker also must be available and match the gig’s service area, language, and category.
+- Server-side gig eligibility: authorized identity verification, admin approval, training completed, and active account. The worker must be available and match the Udupi district, language, and selected gig type; gigs are visible across supported Udupi localities.
 - Admin-created open gigs or offers for a selected eligible worker. Gig details include a summary, instructions, client contact/address, schedule, duration, offered payout, priority, and care notes. Client contact and detailed task data are hidden until the worker accepts.
 - Mobile worker home with incoming offer popup, pass/accept actions, location/category/date/payout filters, active task details, navigation link, availability, and status reasons.
 - Concurrency-safe gig acceptance, recorded pass decisions, sequential `On the Way → Reached → Helping → Done` updates, and an admin/client completion code before completion.

@@ -17,6 +17,7 @@ Status reflects the gig-worker management platform in this iteration. SQLite-bac
 - [x] Separate identity verification, admin approval, training status, account state, and availability.
 - [x] Training is admin-controlled and records who changed it and when; no worker LMS or self-completion.
 - [x] Backend eligibility check and worker-facing reasons.
+- [x] Udupi district boundary with supported locality selectors on worker onboarding and admin gig creation.
 - [ ] Automated Aadhaar verification provider integration — blocked until an authorized provider and credentials are configured.
 
 ## Gigs and task execution
@@ -24,6 +25,9 @@ Status reflects the gig-worker management platform in this iteration. SQLite-bac
 - [x] Admin creates open gigs or targets one eligible worker.
 - [x] Gig preview hides client contact, full address, and care details until acceptance.
 - [x] Worker can preview, accept, pass, filter, and view accepted/history records.
+- [x] Open gigs match eligible workers across Udupi localities; locality remains visible in the offer.
+- [x] Eligible offline workers can browse matching offers; accepting remains blocked until availability is on.
+- [x] Worker task tabs filter the queue and keep the selected tab highlighted.
 - [x] Conditional assignment prevents two workers claiming the same gig.
 - [x] Sequential task progress with timestamps, worker attribution, admin notifications, and activity history.
 - [x] Completion requires a client/organisation code.
@@ -42,7 +46,7 @@ Status reflects the gig-worker management platform in this iteration. SQLite-bac
 
 ## Verification
 
-- [x] `python -m unittest discover -s tests -v` — passed locally against SQLite.
+- [x] `python -m unittest discover -s tests -v` — 13 tests passed locally against SQLite, including Udupi boundary and cross-locality matching.
 - [x] `node --check frontend/app.js` — passed.
 - [ ] PostgreSQL migration and Docker Compose execution — not verified in this workspace.
 - [ ] Live browser E2E run — not performed.
